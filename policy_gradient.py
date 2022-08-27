@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import io 
 
 from torch.nn.functional import one_hot, log_softmax, softmax, normalize
 from torch.distributions import Categorical
@@ -12,25 +13,24 @@ from model import  NASModel
 
 
 class PolicyGradient:
-    def __init__(self, config, train_set, test_set, use_cuda=False):
+    def __init__(self, config, train_set, test_set, use_cuda=False, in_channels=1, dataset=''):
 
         self.NUM_EPOCHS = config.NUM_EPOCHS
         self.ALPHA = config.ALPHA
         self.BATCH_SIZE = config.BATCH_SIZE # number of models to generate for each action
         self.HIDDEN_SIZE = config.HIDDEN_SIZE
         self.BETA = config.BETA
-        self.GAMMA = config.GAMMA
         self.DEVICE = torch.device('cuda' if torch.cuda.is_available() and use_cuda else 'cpu')
         self.INPUT_SIZE = config.INPUT_SIZE
         self.NUM_STEPS = config.NUM_STEPS
         self.ACTION_SPACE = config.ACTION_SPACE
-
         self.train = train_set
         self.test = test_set
+        self.IN_CHANNELS = in_channels
+        self.dataset = dataset
 
         # instantiate the tensorboard writer
-        self.writer = SummaryWriter(comment=f'_PG_CP_Gamma={self.GAMMA},'
-                                            f'LR={self.ALPHA},'
+        self.writer = SummaryWriter(comment=f'LR={self.ALPHA},'
                                             f'BS={self.BATCH_SIZE},'
                                             f'NH={self.HIDDEN_SIZE},'
                                             f'BETA={self.BETA}')
@@ -63,9 +63,10 @@ class PolicyGradient:
                 (episode_weighted_log_prob_trajectory,
                  episode_logits,
                  sum_of_episode_rewards) = self.play_episode()
-
                 # after each episode append the sum of total rewards to the deque
                 self.total_rewards.append(sum_of_episode_rewards)
+
+                print('Total Rewards: ', self.total_rewards)
 
                 # append the weighted log-probabilities of actions
                 epoch_weighted_log_probs = torch.cat((epoch_weighted_log_probs, episode_weighted_log_prob_trajectory),
@@ -99,9 +100,9 @@ class PolicyGradient:
                                    scalar_value=entropy,
                                    global_step=epoch)
             # check if solved
-            # if np.mean(self.total_rewards) > 200:
-            #     print('\nSolved!')
-            #     break
+            if np.mean(self.total_rewards) > 200:
+                print('\nSolved!')
+                break
             epoch += 1
         # close the writer
         self.writer.close()
@@ -117,33 +118,49 @@ class PolicyGradient:
                 sum_of_rewards: sum of the rewards for the episode - needed for the average over 200 episode statistic
         """
         # Init state
-        init_state = [[3, 8, 16]]
-
+        init_state = [[8, 16, 32]]
         # get the action logits from the agent - (preferences)
         episode_logits = self.agent(torch.tensor(init_state).float().to(self.DEVICE))
-
-        # sample an action according to the action distribution
+        # sample an action according to the action distribution    
         action_index = Categorical(logits=episode_logits).sample().unsqueeze(1)
-
+ 
         mask = one_hot(action_index, num_classes=self.ACTION_SPACE)
 
         episode_log_probs = torch.sum(mask.float() * log_softmax(episode_logits, dim=1), dim=1)
 
         # append the action to the episode action list to obtain the trajectory
         # we need to store the actions and logits so we could calculate the gradient of the performance
-        #episode_actions = torch.cat((episode_actions, action_index), dim=0)
+        # episode_actions = torch.cat((episode_actions, action_index), dim=0)
 
         # Get action actions
-        action_space = torch.tensor([[3, 5, 7], [8, 16, 32], [3, 5, 7], [8, 16, 32]], device=self.DEVICE)
+        action_space = torch.tensor([[3, 5, 7], 
+                                     [8, 16, 32], 
+                                     [0, 1 , 2],
+                                     [3, 5, 7], 
+                                     [8, 16, 32],
+                                     [0, 1 , 2]], device=self.DEVICE)
+                             
         action = torch.gather(action_space, 1, action_index).squeeze(1)
         # generate a submodel given predicted actions
-        net = NASModel(action)
+        print('Action Space: ' ,action)
+        net = NASModel(self.IN_CHANNELS, action)
         #net = Net()
+
+
+        total = 0
+        print('Trainable parameters:')
+        for name, param in net.named_parameters():
+            if param.requires_grad:
+                print(name, '\t', param.numel())
+                total += param.numel()
+        print()
+        print('Total', '\t', total)
+
 
         criterion = nn.CrossEntropyLoss()
         optimizer = optim.SGD(net.parameters(), lr=0.001, momentum=0.9)
 
-        for epoch in range(2):  # loop over the dataset multiple times
+        for epoch in range(self.NUM_EPOCHS):  # loop over the dataset multiple times
 
             running_loss = 0.0
             for i, data in enumerate(self.train, 0):
@@ -168,6 +185,7 @@ class PolicyGradient:
 
         print('Finished Training')
 
+
         # load best performance epoch in this training session
         # model.load_weights('weights/temp_network.h5')
 
@@ -184,9 +202,15 @@ class PolicyGradient:
 
         acc = 100 * correct / total
         print('Accuracy of the network on the 10000 test images: {}'.format(acc))
-
+        torch.save(net.state_dict(), './models_weights/' + self.dataset + '_' + str(acc).replace('.', '_') + '.pt')
         # compute the reward
         reward = acc
+
+        # log action space with reward
+        log_str = self.dataset + "Action Space:  "+ str(action) + ", last_reward:  "+str(reward)+"\n"
+        log = open("log.txt", "a+")
+        log.write(log_str)
+        log.close()
 
         episode_weighted_log_probs = episode_log_probs * reward
         sum_weighted_log_probs = torch.sum(episode_weighted_log_probs).unsqueeze(dim=0)
